@@ -198,7 +198,7 @@ class BaseProvider:
         *,
         messages: list[dict],
         tools: Optional[list[dict[str, Any]]] = None,
-        temprature: float = 0.7,
+        temperature: float = 0.7,
         tool_choice: str | dict[str, Any] = "auto",
         verbose: bool = False,
     ) -> ChatResponse:
@@ -217,7 +217,7 @@ class BaseProvider:
         *,
         messages: list[dict],
         tools: Optional[list[dict[str, Any]]] = None,
-        temprature: float = 0.7,
+        temperature: float = 0.7,
         tool_choice: str | dict[str, Any] = "auto",
         verbose: bool = False,
     ) -> ChatResponse:
@@ -261,8 +261,7 @@ class OpenAiCompatibleProvider(BaseProvider):
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         temperature: float = 0.7,
-        tool_choice: str | dict[str, Any] = "auto",
-        verbose: bool = False,
+        tool_choice: str | dict[str, Any] = "auto"
     ) -> str:
         kwargs = {
             "model": self.config.model_name,
@@ -325,7 +324,6 @@ class OpenAiCompatibleProvider(BaseProvider):
         response = self.client.chat.completions.create(**kwargs)
         final_usage: Optional[TokenUsage] = None
         for chunk in response:
-            print("chunk", chunk)
             if getattr(chunk, "usage", None) is not None:
                 final_usage = self._extract_usage(chunk)
             if not chunk.choices:
@@ -350,3 +348,49 @@ def get_provider(name: str) -> BaseProvider:
     #     return NativeProvider(_load_config(name))
 
     raise ValueError(f"Unsupported provider: {chosen}")
+
+def _is_failoverable(self, exc: BaseException) -> bool:
+    
+
+def get_failover_provider(self, names: list) -> FailoverProvider:
+    providers = [get_provider(name) for name in names]
+    return FailoverProvider(providers)
+
+class FailoverProvider(BaseProvider):
+    def __init__(self, providers: BaseProvider):
+        self.providers = providers
+        self._active_index = 0
+    
+    @property
+    def active_provider(self):
+        return self.providers[self._active_index]
+
+    def _provider_indicies(self):
+        start = self._active_index
+        return list(range(start, len(self.providers)))
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        tool_choice: str | dict[str, Any] = "auto"
+    ) -> ChatResponse:
+        errs = []
+        last_exc = None
+        indicies = self._provider_indicies()
+
+        for pos, index in enumerate(indicies):
+            provider = self.providers[index]
+
+            try:
+
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: Optional[list[dict[str, Any]]] = None,
+        temperature: float = 0.7,
+        tool_choice: str | dict[str, Any] = "auto"
+    ) -> Iterator[Any]:
+        pass
