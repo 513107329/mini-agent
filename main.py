@@ -20,6 +20,7 @@ class ReactLoop:
         no_stream: bool = False,
     ):
         self.max_iter = max_iter
+        self.tool_md5 = {}
         self.verbose = verbose
         self.no_stream = no_stream
         self.messages = [
@@ -64,6 +65,7 @@ class ReactLoop:
                             {"role": "assistant", "content": result.content}
                         )
 
+                        self.tool_md5 = {}
                         self.iter = 0
                         if self.verbose:
                             print("[Task Complete] 最终回答已生成。")
@@ -84,6 +86,14 @@ class ReactLoop:
                         tool_id = tc.tool_id
                         tool_name = tc.tool_name
                         tool_args = json.loads(tc.tool_args)
+                        tool_md5_str = f"{tool_name}:{",".join([f"{key}:{tool_args[key]}" for key in sorted(tool_args.keys())])}"
+                        count = self.tool_md5.get(tool_md5_str, 0) + 1
+                        self.tool_md5[tool_md5_str] = count
+                        if count == 2:
+                            print("连续两次相同工具调用，疑似发生了循环,再触发一次即将熔断")
+                        elif count >= 3:
+                            self.tool_md5 = {}
+                            raise RuntimeError("连续三次相同工具调用，触发熔断")
                         tool_result = toolRegistry.get_tool(tool_name).run(tool_args)
                         self.messages.append(
                             {
