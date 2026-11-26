@@ -19,7 +19,6 @@ def get_weather_from_api(city: str, key: str) -> str:
         result = json.loads(raw_data)
         if result.get("status") != "1":
             raise ValueError(result.get("info"))
-        print(result)
         live = result.get("lives")[0]
         province = live.get("province", "未知")
         city_name = live.get("city", city)

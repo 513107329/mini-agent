@@ -15,6 +15,9 @@ class Tool:
     func: Callable
     schema: dict[str, dict[str, Any]]
 
+    def run(self, args: dict[str, Any]) -> str:
+        return self.func(**args)
+
 
 class ToolRegistry:
     def __init__(self):

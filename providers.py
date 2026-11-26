@@ -3,7 +3,13 @@ from asyncio import streams
 from dataclasses import dataclass, field
 import os
 from typing import Any, Iterator, Optional
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    RateLimitError,
+)
 from tools.tool import toolRegistry
 
 # OpenAI 兼容厂商（换 config 即可）
@@ -87,14 +93,14 @@ class UsageTracker:
             acc += item
         return acc
 
-    def _summary(self) -> dict:
+    def summary(self) -> dict:
         """
         Summary of the usage tracker.
         """
         t = self.total
         return (
-            f"calls={len(self.records)}, prompt={t.prompt_tokens}, "
-            f"completion={t.completion_tokens}, total={t.total_tokens}"
+            f"calls={len(self.records)}, prompt={t.prompt_token}, "
+            f"completion={t.completion_token}, total={t.total_token}"
         )
 
     def reset(self):
@@ -191,6 +197,9 @@ class BaseProvider:
     def __init__(self, config: ProviderConfig):
         self.config = config
         self.usage_tracker = UsageTracker()
+        self.iter = 0
+        self.max_iter = 10
+        self.verbose = False
 
     @abstractmethod
     def chat(
@@ -199,8 +208,7 @@ class BaseProvider:
         messages: list[dict],
         tools: Optional[list[dict[str, Any]]] = None,
         temperature: float = 0.7,
-        tool_choice: str | dict[str, Any] = "auto",
-        verbose: bool = False,
+        tool_choice: str | dict[str, Any] = "auto"
     ) -> ChatResponse:
         """
         Chat with the provider.
@@ -218,8 +226,7 @@ class BaseProvider:
         messages: list[dict],
         tools: Optional[list[dict[str, Any]]] = None,
         temperature: float = 0.7,
-        tool_choice: str | dict[str, Any] = "auto",
-        verbose: bool = False,
+        tool_choice: str | dict[str, Any] = "auto"
     ) -> ChatResponse:
         """
         Chat with the provider.
@@ -249,9 +256,9 @@ class OpenAiCompatibleProvider(BaseProvider):
             return None
 
         return TokenUsage(
-            prompt_token=getattr(usage, "prompt_tokens", 0),
-            completion_token=getattr(usage, "completion_tokens", 0),
-            total_token=getattr(usage, "total_tokens", 0),
+            prompt_token=getattr(usage, "prompt_token", 0),
+            completion_token=getattr(usage, "completion_token", 0),
+            total_token=getattr(usage, "total_token", 0),
             model=self.config.model_name,
             provider=self.config.name,
         )
@@ -261,7 +268,7 @@ class OpenAiCompatibleProvider(BaseProvider):
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         temperature: float = 0.7,
-        tool_choice: str | dict[str, Any] = "auto"
+        tool_choice: str | dict[str, Any] = "auto",
     ) -> str:
         kwargs = {
             "model": self.config.model_name,
@@ -277,8 +284,6 @@ class OpenAiCompatibleProvider(BaseProvider):
         response = self.client.chat.completions.create(**kwargs)
 
         response_message = response.choices[0].message
-
-        print("response_message", response_message)
 
         tool_calls: list[ToolCallRequest] = []
 
@@ -329,7 +334,7 @@ class OpenAiCompatibleProvider(BaseProvider):
             if not chunk.choices:
                 continue
             yield chunk.choices[0].delta
-        
+
         self.usage_tracker.add_record(final_usage)
 
 
@@ -338,6 +343,7 @@ def get_provider(name: str) -> BaseProvider:
     Get a provider by name.
     """
     chosen = (name or _env("DEFAULT_PROVIDER", "deepseek") or "deepseek").lower()
+    print('chosen', chosen)
 
     if chosen not in SUPPORTED_PROVIDERS:
         raise ValueError(f"Unsupported provider: {chosen}")
@@ -349,18 +355,29 @@ def get_provider(name: str) -> BaseProvider:
 
     raise ValueError(f"Unsupported provider: {chosen}")
 
-def _is_failoverable(self, exc: BaseException) -> bool:
-    
 
-def get_failover_provider(self, names: list) -> FailoverProvider:
+def _is_failoverable(exc: BaseException) -> bool:
+    """
+    Check if an exception is failoverable.
+    """
+    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
+        return True
+    if isinstance(exc, APIStatusError) and exc.status_code in (429, 500, 502, 503, 504):
+        return True
+    return False
+
+
+def get_failover_provider(names: list) -> FailoverProvider:
     providers = [get_provider(name) for name in names]
     return FailoverProvider(providers)
 
+
 class FailoverProvider(BaseProvider):
     def __init__(self, providers: BaseProvider):
+        super().__init__(providers.config)
         self.providers = providers
         self._active_index = 0
-    
+
     @property
     def active_provider(self):
         return self.providers[self._active_index]
@@ -369,12 +386,15 @@ class FailoverProvider(BaseProvider):
         start = self._active_index
         return list(range(start, len(self.providers)))
 
+    def record_usage(self, usage: TokenUsage):
+        self.usage_tracker.add_record(usage)
+
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         temperature: float = 0.7,
-        tool_choice: str | dict[str, Any] = "auto"
+        tool_choice: str | dict[str, Any] = "auto",
     ) -> ChatResponse:
         errs = []
         last_exc = None
@@ -384,13 +404,52 @@ class FailoverProvider(BaseProvider):
             provider = self.providers[index]
 
             try:
+                resposne = provider.chat(messages, tools, temperature, tool_choice)
+                self._active_index = index
+                self.record_usage(resposne.usage)
+                self.config = provider.config
+                return resposne
+            except Exception as e:
+                last_exc = e
+                errs.append(f"provider {provider.config.name} error: {e}")
+                can_try_next = _is_failoverable(e) and pos < len(indicies) - 1
+                if not can_try_next:
+                    break
 
+        detail = "|".join(errs) if errs else str(last_exc)
+        raise ValueError(f"failover error: {detail}") from last_exc
 
     def chat_stream(
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
         temperature: float = 0.7,
-        tool_choice: str | dict[str, Any] = "auto"
+        tool_choice: str | dict[str, Any] = "auto",
     ) -> Iterator[Any]:
-        pass
+        last_exc = None
+        errs = []
+        indicies = self._provider_indicies()
+        for pos, index in enumerate(indicies):
+            provider = self.providers[index]
+
+            try:
+                stream = provider.chat_stream(messages, tools, temperature, tool_choice)
+                first = next(stream, None)
+            except Exception as e:
+                last_exc = e
+                errs.append(f"provider {provider.config.name} error: {e}")
+                can_try_next = _is_failoverable(e) and pos < len(indicies) - 1
+                if not can_try_next:
+                    break
+                continue
+
+            if first is not None:
+                yield first
+            yield from stream
+            self._active_index = index
+            self.usage_tracker.records.extend(provider.usage_tracker.records)
+            self.config = provider.config
+            return
+
+        detail = "|".join(errs) if errs else str(last_exc)
+        raise ValueError(f"failover error: {detail}") from last_exc
