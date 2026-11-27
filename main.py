@@ -1,4 +1,5 @@
 import argparse
+from difflib import SequenceMatcher
 from enum import Enum
 import json
 import time
@@ -46,6 +47,7 @@ class ReactLoop:
         self.iter = 0
         self.last_tool_call_fp: str = ""   # 上一次调用的工具指纹
         self.consecutive_repeats: int = 0  # 连续重复调用次数
+        self.last_assistant_content: str = ""  # 上一轮助手文本回复
         self.start_time: float = 0.0
 
         if failover is not None:
@@ -56,11 +58,26 @@ class ReactLoop:
             raise ValueError("请输入正确的provider或failover")
 
     def _reset_loop_state(self) -> None:
-        """重置单次任务的运行状态（迭代轮次、计时与死循环检测指纹）"""
+        """重置单次任务的运行状态（迭代轮次、计时与收敛检测状态）"""
         self.iter = 0
         self.last_tool_call_fp = ""
         self.consecutive_repeats = 0
+        self.last_assistant_content = ""
         self.start_time = 0.0
+
+    def _check_text_convergence(self, content: str | None, threshold: float = 0.9) -> bool:
+        """检测连续两轮助手文本回复是否高度相似（排除空文本）"""
+        curr = (content or "").strip()
+        if not curr:
+            self.last_assistant_content = ""
+            return False
+
+        prev = self.last_assistant_content
+        self.last_assistant_content = curr
+        if not prev:
+            return False
+
+        return SequenceMatcher(None, prev, curr).ratio() >= threshold
 
     def _check_tool_loop(self, tool_name: str, tool_args: dict) -> tuple[bool, str]:
         """
@@ -145,6 +162,25 @@ class ReactLoop:
 
         return None
 
+    def _handle_tool_turn(self, result: ChatResponse) -> tuple[StopReason, str] | None:
+        """处理模型返回 tool_calls 的一轮：先判文本收敛，再执行工具调用"""
+        if self._check_text_convergence(result.content):
+            converged_msg = "连续两轮模型回复高度相似，判定为收敛，任务终止。"
+            if self.verbose:
+                print(f"\n[Converged]: {converged_msg}")
+            self.messages.append({"role": "assistant", "content": converged_msg})
+            self._reset_loop_state()
+            return (StopReason.CONVERGED, converged_msg)
+
+        self.messages.append(result.to_assistant_message())
+        if self.verbose:
+            tool_names = [tc.tool_name for tc in result.tool_calls]
+            print(
+                f"[Action] 模型决定调用工具 ({len(result.tool_calls)} 个): {tool_names}"
+            )
+
+        return self._execute_tool_calls(result.tool_calls)
+
     def run(self, input_str: str, timeout_s: float = 60.0) -> tuple[StopReason, str]:
         """
         执行 react loop
@@ -198,14 +234,7 @@ class ReactLoop:
                             )
                         return (StopReason.COMPLETED, result.content)
 
-                    self.messages.append(result.to_assistant_message())
-                    if self.verbose:
-                        tool_names = [tc.tool_name for tc in result.tool_calls]
-                        print(
-                            f"[Action] 模型决定调用工具 ({len(result.tool_calls)} 个): {tool_names}"
-                        )
-
-                    break_msg = self._execute_tool_calls(result.tool_calls)
+                    break_msg = self._handle_tool_turn(result)
                     if break_msg is not None:
                         return break_msg
                 else:
@@ -258,15 +287,7 @@ class ReactLoop:
                         content=content,
                         provider_name=self.provider.config.name,
                     )
-                    self.messages.append(result.to_assistant_message())
-
-                    if self.verbose:
-                        tool_names = [tc.get("tool_name") for tc in acc.values()]
-                        print(
-                            f"[Action] 模型决定调用工具 ({len(acc)} 个): {tool_names}"
-                        )
-
-                    break_msg = self._execute_tool_calls(tool_calls)
+                    break_msg = self._handle_tool_turn(result)
                     if break_msg is not None:
                         return break_msg
 

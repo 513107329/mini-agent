@@ -321,6 +321,7 @@ class OpenAiCompatibleProvider(BaseProvider):
             "messages": messages,
             "temperature": temperature,
             "stream": True,
+            "stream_options": {"include_usage": True}
         }
 
         if tools and len(tools) > 0:
