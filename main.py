@@ -1,5 +1,7 @@
 import argparse
+from enum import Enum
 import json
+import time
 from providers import (
     ChatResponse,
     ToolCallRequest,
@@ -9,6 +11,20 @@ from providers import (
 from tools.tool import toolRegistry
 
 
+class StopReason(str, Enum):
+    INTERRUPTED = "interrupted"
+    COMPLETED = "completed"
+    BUDGET = "budget"
+    TIMEOUT = "timeout"
+    CONVERGED = "converged"
+    MAX_ITER = "max_iter"
+    ERROR = "error"
+
+
+Budget = {
+    "max_tokens_budget": 1500
+}
+
 class ReactLoop:
     def __init__(
         self,
@@ -16,7 +32,7 @@ class ReactLoop:
         provider: str | None = None,
         max_iter: int = 3,
         verbose: bool = False,
-        no_stream: bool = False,
+        no_stream: bool = False
     ):
         self.max_iter = max_iter
         self.verbose = verbose
@@ -30,6 +46,7 @@ class ReactLoop:
         self.iter = 0
         self.last_tool_call_fp: str = ""   # 上一次调用的工具指纹
         self.consecutive_repeats: int = 0  # 连续重复调用次数
+        self.start_time: float = 0.0
 
         if failover is not None:
             self.provider = get_failover_provider(names=failover)
@@ -39,10 +56,11 @@ class ReactLoop:
             raise ValueError("请输入正确的provider或failover")
 
     def _reset_loop_state(self) -> None:
-        """重置单次任务的运行状态（迭代轮次与死循环检测指纹）"""
+        """重置单次任务的运行状态（迭代轮次、计时与死循环检测指纹）"""
         self.iter = 0
         self.last_tool_call_fp = ""
         self.consecutive_repeats = 0
+        self.start_time = 0.0
 
     def _check_tool_loop(self, tool_name: str, tool_args: dict) -> tuple[bool, str]:
         """
@@ -100,7 +118,7 @@ class ReactLoop:
                 break_msg = f"任务因死循环熔断终止：{warning_msg}"
                 self.messages.append({"role": "assistant", "content": break_msg})
                 self._reset_loop_state()
-                return break_msg
+                return (StopReason.CONVERGED, break_msg)
 
             tool = toolRegistry.get_tool(tool_name)
             if tool is None:
@@ -127,20 +145,37 @@ class ReactLoop:
 
         return None
 
-    def run(self, input_str: str) -> str:
+    def run(self, input_str: str, timeout_s: float = 60.0) -> tuple[StopReason, str]:
         """
         执行 react loop
         """
         self._reset_loop_state()
+        self.start_time = time.monotonic()
+        start_tokens = self.provider.usage_tracker.total.total_token
         self.messages.append({"role": "user", "content": input_str})
 
         while True:
-            if self.iter >= self.max_iter:
-                max_iter_msg = f"已超出最大迭代轮数 ({self.max_iter})，任务强制终止。"
-                self.messages.append({"role": "assistant", "content": max_iter_msg})
-                self._reset_loop_state()
-                return max_iter_msg
             try:
+                task_tokens = self.provider.usage_tracker.total.total_token - start_tokens
+                if task_tokens > Budget["max_tokens_budget"]:
+                    budget_msg = f"超出预算 ({task_tokens} > {Budget['max_tokens_budget']})"
+                    self.messages.append({"role": "assistant", "content": budget_msg})
+                    self._reset_loop_state()
+                    return (StopReason.BUDGET, budget_msg)
+
+                elapsed = time.monotonic() - self.start_time
+                if elapsed > timeout_s:
+                    timeout_msg = f"超时执行 ({elapsed:.2f}s > {timeout_s}s)"
+                    self.messages.append({"role": "assistant", "content": timeout_msg})
+                    self._reset_loop_state()
+                    return (StopReason.TIMEOUT, timeout_msg)
+
+                if self.iter >= self.max_iter:
+                    max_iter_msg = f"已超出最大迭代轮数 ({self.max_iter})，任务强制终止。"
+                    self.messages.append({"role": "assistant", "content": max_iter_msg})
+                    self._reset_loop_state()
+                    return (StopReason.MAX_ITER, max_iter_msg)
+
                 self.iter += 1
                 if self.verbose:
                     print(f"第{self.iter}轮迭代: Thought: {self.messages}")
@@ -161,7 +196,7 @@ class ReactLoop:
                             print(
                                 f"[Usage Total] {self.provider.usage_tracker.summary()}"
                             )
-                        return result.content
+                        return (StopReason.COMPLETED, result.content)
 
                     self.messages.append(result.to_assistant_message())
                     if self.verbose:
@@ -207,7 +242,7 @@ class ReactLoop:
                             print(
                                 f"[Usage Total] {self.provider.usage_tracker.summary()}"
                             )
-                        return content
+                        return (StopReason.COMPLETED, content)
 
                     tool_calls = [
                         ToolCallRequest(
@@ -235,9 +270,13 @@ class ReactLoop:
                     if break_msg is not None:
                         return break_msg
 
+            except KeyboardInterrupt:
+                self._reset_loop_state()
+                return (StopReason.INTERRUPTED, "中断执行")
+
             except Exception as e:
                 self._reset_loop_state()
-                return f"执行出错：{e}"
+                return (StopReason.ERROR, f"执行出错: {e}")
 
 
 def str_to_bool(value: str) -> bool:
@@ -283,9 +322,10 @@ if __name__ == "__main__":
     while True:
         try:
             query = input("请输入你的问题: ")
-        except (KeyboardInterrupt, EOFError):
-            print("\n退出")
+        except (KeyboardInterrupt,EOFError):
+            print("退出")
             break
+
         query = query.strip()
         if not query:
             continue
@@ -322,5 +362,8 @@ if __name__ == "__main__":
             print("Unknown command")
             continue
 
-        result = react_loop.run(query)
-        print(f"最终回答: {result}")
+        reason, answer = react_loop.run(query)
+        if reason == StopReason.COMPLETED:
+            print(f"最终回答: {answer}")
+        else:
+            print(f"[{reason.value}] {answer}")

@@ -250,15 +250,16 @@ class OpenAiCompatibleProvider(BaseProvider):
         )
 
     def _extract_usage(self, response: any) -> TokenUsage | None:
+        print("usage", response)
         usage = getattr(response, "usage", None)
 
         if usage is None:
             return None
 
         return TokenUsage(
-            prompt_token=getattr(usage, "prompt_token", 0),
-            completion_token=getattr(usage, "completion_token", 0),
-            total_token=getattr(usage, "total_token", 0),
+            prompt_token=getattr(usage, "prompt_tokens", 0),
+            completion_token=getattr(usage, "completion_tokens", 0),
+            total_token=getattr(usage, "total_tokens", 0),
             model=self.config.model_name,
             provider=self.config.name,
         )
